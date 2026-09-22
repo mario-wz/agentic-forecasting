@@ -1,0 +1,384 @@
+# %% [markdown]
+# # Supplement Sales Baseline Forecasts
+# 
+# ## Executive overview
+# 
+# This notebook establishes the conventional forecasting benchmark for the supplement-sales project. Its main objective is to estimate future **weekly units sold** for each supplement product using only information that would have been available at a historical decision date. The resulting baseline is the reference point for the later agentic forecasting notebooks: a more sophisticated forecasting approach should demonstrate improvement over these simple, reproducible models on the same information set and evaluation window.
+# 
+# The experiment uses one chronological holdout. Every product is trained through **2024-12-30** and evaluated on the following **13 weeks, from 2025-01-06 through 2025-03-31**. No observations after the cutoff are used to fit a model. This preserves the forecasting direction of time and avoids random train/test mixing.
+# 
+# The source database is the weekly CSV `Supplement_Sales_Weekly_Expanded.csv`. It contains **4,384 rows**, **16 products**, and **274 weekly dates**, covering 2020-01-06 through 2025-03-31. Each row identifies a product-week and includes the target (`Units Sold`) plus commercial context: category, price, revenue, discount, units returned, location, and platform. Products are modeled independently; the notebook does not pool sales across products.
+# 
+# Five point-forecast baselines are compared:
+# 
+# 1. **Last Value**: repeats the most recent observed sales value and provides the naive benchmark floor.
+# 2. **ARIMA**: an explicit univariate ARIMA(2, 1, 2) model.
+# 3. **AutoARIMA**: Darts' automated ARIMA implementation.
+# 4. **Prophet**: a univariate trend model with yearly seasonality.
+# 5. **LightGBM**: a multivariate recursive model using target lags, calendar features, lagged commercial context, and product category.
+# 
+# Performance is reported with MAE, RMSE, MAPE, and sMAPE. Lower values are better. Because this is a single 13-week holdout, the results are a diagnostic benchmark rather than proof that one model will always be best.
+
+# %%
+import logging
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from darts import TimeSeries
+from darts.models import AutoARIMA
+from IPython.display import display
+from lightgbm import LGBMRegressor
+from prophet import Prophet
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from statsmodels.tsa.arima.model import ARIMA
+
+
+warnings.filterwarnings("ignore")
+logging.getLogger("prophet").setLevel(logging.ERROR)
+pd.set_option("display.max_columns", 30)
+pd.set_option("display.float_format", lambda value: f"{value:,.3f}")
+
+# %% [markdown]
+# ## 1. Configuration, database, and temporal design
+# 
+# The input database is a denormalized weekly product-sales table. The natural forecasting key is `(Product Name, Date)`, and the target is `Units Sold`. The dataset has one weekly observation for each of 16 products across 274 dates, giving 4,384 product-week records. The target is converted to numeric values and each product is reindexed against the complete weekly calendar before modeling; missing target weeks therefore fail loudly instead of being silently imputed.
+# 
+# The fields have the following roles:
+# 
+# | Field | Role in this notebook |
+# |---|---|
+# | `Date` | Weekly time index and chronological split key |
+# | `Product Name` | Independent series identifier |
+# | `Category` | Static LightGBM feature |
+# | `Units Sold` | Forecast target |
+# | `Price`, `Revenue`, `Discount`, `Units Returned` | Lagged LightGBM context features |
+# | `Location`, `Platform` | Loaded for context but excluded because future values are unknown |
+# 
+# The information cutoff is **2024-12-30**. All target and context values through that date are available to model fitting. The evaluation period is the next 13 weekly observations. This is a strict time split rather than a random split, so the test period represents a future forecasting task.
+# 
+# The LightGBM model requires an additional assumption: because future prices, discounts, revenue, and returns are not supplied, it carries each numeric context variable forward at its last observed value during recursive prediction. This makes the model operationally runnable, but it should not be interpreted as evidence that those future commercial variables were known. If a planning system provides future covariates, they should replace this carried-forward assumption.
+
+# %%
+DATA_PATH = Path("Supplement_Sales_Weekly_Expanded.csv")
+DATE_COL = "Date"
+PRODUCT_COL = "Product Name"
+TARGET_CANDIDATES = ("Unit Sold", "Units Sold")
+TRAIN_END_DATE = pd.Timestamp("2024-12-30")
+PRODUCTS_TO_RUN = None  # None = train every product; e.g. ["Whey Protein"] = one product
+PRODUCT_TO_PLOT = "Whey Protein"
+ARIMA_ORDER = (2, 1, 2)
+LAGS = (1, 2, 3, 4, 8, 12)
+LIGHTGBM_CONTEXT_LAGS = (1, 2, 4, 8, 12)
+LIGHTGBM_NUMERIC_CONTEXT = ("Price", "Revenue", "Discount", "Units Returned")
+LIGHTGBM_STATIC_CONTEXT = ("Category",)
+RANDOM_STATE = 42
+
+if not DATA_PATH.exists():
+    DATA_PATH = Path("implementations/supplement_sales/Supplement_Sales_Weekly_Expanded.csv")
+sales = pd.read_csv(DATA_PATH, parse_dates=[DATE_COL])
+target_col = next((column for column in TARGET_CANDIDATES if column in sales.columns), None)
+if target_col is None:
+    raise ValueError(f"Expected one of {TARGET_CANDIDATES}; found {sales.columns.tolist()}")
+
+missing_context = [column for column in (*LIGHTGBM_NUMERIC_CONTEXT, *LIGHTGBM_STATIC_CONTEXT) if column not in sales.columns]
+if missing_context:
+    raise ValueError(f"Missing configured LightGBM context columns: {missing_context}")
+
+sales = sales.sort_values([PRODUCT_COL, DATE_COL]).reset_index(drop=True)
+sales[target_col] = pd.to_numeric(sales[target_col], errors="raise")
+products = sales[PRODUCT_COL].dropna().unique().tolist()
+if PRODUCTS_TO_RUN is None:
+    products_to_run = products
+else:
+    unknown_products = sorted(set(PRODUCTS_TO_RUN) - set(products))
+    if unknown_products:
+        raise ValueError(f"Unknown product(s) in PRODUCTS_TO_RUN: {unknown_products}")
+    products_to_run = list(dict.fromkeys(PRODUCTS_TO_RUN))
+if PRODUCT_TO_PLOT not in products_to_run:
+    raise ValueError("PRODUCT_TO_PLOT must be included in PRODUCTS_TO_RUN, or set PRODUCTS_TO_RUN=None.")
+
+available_dates = pd.DatetimeIndex(sales[DATE_COL].drop_duplicates().sort_values())
+if TRAIN_END_DATE not in available_dates:
+    raise ValueError("TRAIN_END_DATE must be one of the weekly dates in the data.")
+
+test_dates = available_dates[available_dates > TRAIN_END_DATE]
+if len(test_dates) == 0:
+    raise ValueError("TRAIN_END_DATE leaves no future observations for evaluation.")
+
+print(f"Loaded {len(sales):,} rows, {len(products)} products, and {len(available_dates)} weekly dates.")
+print(f"Training products: {len(products_to_run)}; target: {target_col}; train through {TRAIN_END_DATE.date()}; test horizon: {len(test_dates)} weeks.")
+print(f"LightGBM context: numeric lags {LIGHTGBM_NUMERIC_CONTEXT}; static {LIGHTGBM_STATIC_CONTEXT}.")
+display(sales.head())
+
+# %%
+def product_frame(product_name):
+    product = sales.loc[sales[PRODUCT_COL] == product_name].copy()
+    product = product.set_index(DATE_COL).sort_index()
+    product = product.reindex(available_dates)
+    if product[target_col].isna().any():
+        raise ValueError(f"{product_name} has missing weekly target values.")
+    return product
+
+
+def product_series(product_name):
+    return product_frame(product_name)[target_col].astype(float)
+
+
+def calendar_features(dates, trend_origin=None):
+    dates = pd.DatetimeIndex(dates)
+    trend_origin = dates.min() if trend_origin is None else pd.Timestamp(trend_origin)
+    trend = (dates - trend_origin).days.to_numpy(dtype=float) / 7.0
+    return pd.DataFrame({
+        "year": dates.year,
+        "month": dates.month,
+        "quarter": dates.quarter,
+        "week_of_year": dates.isocalendar().week.astype(int).to_numpy(),
+        "trend": trend,
+    }, index=dates)
+
+
+def make_lagged_frame(series):
+    frame = calendar_features(series.index, series.index.min())
+    for lag in LAGS:
+        frame[f"lag_{lag}"] = series.shift(lag)
+    frame["target"] = series
+    return frame.dropna()
+
+
+def score_forecast(actual, predicted):
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    denominator = np.maximum((np.abs(actual) + np.abs(predicted)) / 2, 1e-8)
+    return {
+        "MAE": mean_absolute_error(actual, predicted),
+        "RMSE": np.sqrt(mean_squared_error(actual, predicted)),
+        "MAPE": np.mean(np.abs((actual - predicted) / np.maximum(np.abs(actual), 1e-8))) * 100,
+        "sMAPE": np.mean(np.abs(actual - predicted) / denominator) * 100,
+    }
+
+# %% [markdown]
+# ## 2. Baseline model functions
+# 
+# ARIMA, AutoARIMA, Prophet, and Last Value use only the selected product's target history. LightGBM is the multivariate baseline: it uses target lags, calendar features, lagged numeric context (`Price`, `Revenue`, `Discount`, and `Units Returned`), and static `Category` features. Since future context values are not provided, LightGBM carries the last observed numeric context forward during recursive prediction. `Location` and `Platform` are excluded because they are not known for future weeks.
+
+# %%
+def forecast_last_value(train, horizon, context=None):
+    return pd.Series(train.iloc[-1], index=test_dates, dtype=float)
+
+
+def forecast_arima(train, horizon, context=None):
+    model = ARIMA(train, order=ARIMA_ORDER, enforce_stationarity=False, enforce_invertibility=False)
+    return pd.Series(model.fit().forecast(horizon), index=test_dates)
+
+
+def forecast_auto_arima(train, horizon, context=None):
+    series = TimeSeries.from_times_and_values(train.index, train.to_numpy(), freq="W-MON")
+    model = AutoARIMA()
+    model.fit(series)
+    forecast = model.predict(n=horizon)
+    return pd.Series(forecast.values().ravel(), index=test_dates)
+
+
+def forecast_prophet(train, horizon, context=None):
+    prophet_train = train.rename_axis("ds").rename("y").reset_index()
+    model = Prophet(
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        yearly_seasonality=True,
+        seasonality_mode="additive",
+    )
+    model.fit(prophet_train)
+    future = model.make_future_dataframe(periods=horizon, freq="W-MON", include_history=False)
+    forecast = model.predict(future)
+    return pd.Series(forecast["yhat"].to_numpy(), index=test_dates)
+
+
+def forecast_lightgbm(train, horizon, context):
+    context = context.loc[train.index].copy()
+    frame = calendar_features(train.index, train.index.min())
+    for lag in LAGS:
+        frame[f"target_lag_{lag}"] = train.shift(lag)
+    for column in LIGHTGBM_NUMERIC_CONTEXT:
+        numeric_context = pd.to_numeric(context[column], errors="raise")
+        for lag in LIGHTGBM_CONTEXT_LAGS:
+            frame[f"{column}_lag_{lag}"] = numeric_context.shift(lag)
+    for column in LIGHTGBM_STATIC_CONTEXT:
+        frame = pd.concat([frame, pd.get_dummies(context[column], prefix=column, dtype=float)], axis=1)
+    frame["target"] = train
+    frame = frame.dropna()
+    feature_cols = [column for column in frame.columns if column != "target"]
+    model = LGBMRegressor(
+        objective="regression",
+        n_estimators=250,
+        learning_rate=0.03,
+        num_leaves=15,
+        max_depth=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=RANDOM_STATE,
+        verbosity=-1,
+    )
+    model.fit(frame[feature_cols], frame["target"])
+    history = train.copy()
+    context_history = context.copy()
+    predictions = []
+    for date in test_dates[:horizon]:
+        row = calendar_features([date], train.index.min())
+        for lag in LAGS:
+            row[f"target_lag_{lag}"] = history.iloc[-lag]
+        for column in LIGHTGBM_NUMERIC_CONTEXT:
+            for lag in LIGHTGBM_CONTEXT_LAGS:
+                row[f"{column}_lag_{lag}"] = context_history[column].iloc[-lag]
+        for column in LIGHTGBM_STATIC_CONTEXT:
+            row = pd.concat([row, pd.get_dummies(pd.Series([context_history[column].iloc[-1]]), prefix=column, dtype=float).set_index(row.index)], axis=1)
+        row = row.reindex(columns=feature_cols, fill_value=0.0)
+        prediction = float(model.predict(row)[0])
+        predictions.append(prediction)
+        history.loc[date] = prediction
+        context_history.loc[date, list(LIGHTGBM_NUMERIC_CONTEXT)] = context_history.iloc[-1][list(LIGHTGBM_NUMERIC_CONTEXT)]
+        context_history.loc[date, list(LIGHTGBM_STATIC_CONTEXT)] = context_history.iloc[-1][list(LIGHTGBM_STATIC_CONTEXT)]
+    return pd.Series(predictions, index=test_dates[:horizon])
+
+# %% [markdown]
+# ## 3. Fit all baselines and compare performance
+
+# %%
+model_functions = {
+    "Last Value": forecast_last_value,
+    "ARIMA": forecast_arima,
+    "AutoARIMA": forecast_auto_arima,
+    "Prophet": forecast_prophet,
+    "LightGBM": forecast_lightgbm,
+}
+
+forecast_rows = []
+failure_rows = []
+forecast_store = {}
+for product in products_to_run:
+    product_data = product_frame(product)
+    series = product_data[target_col].astype(float)
+    train = series.loc[:TRAIN_END_DATE]
+    context = product_data.loc[:TRAIN_END_DATE]
+    actual = series.loc[test_dates]
+    forecast_store[product] = {"actual": actual}
+    for model_name, model_function in model_functions.items():
+        try:
+            predicted = model_function(train, len(test_dates), context).clip(lower=0)
+            predicted = predicted.reindex(test_dates)
+            forecast_store[product][model_name] = predicted
+            forecast_rows.append({"Product Name": product, "Model": model_name, **score_forecast(actual, predicted)})
+        except Exception as error:
+            failure_rows.append({"Product Name": product, "Model": model_name, "Error": repr(error)})
+
+metrics_by_product = pd.DataFrame(forecast_rows)
+if failure_rows:
+    display(pd.DataFrame(failure_rows))
+    raise RuntimeError("At least one baseline failed; inspect the error table above.")
+
+overall_comparison = (
+    metrics_by_product.groupby("Model")[["MAE", "RMSE", "MAPE", "sMAPE"]]
+    .mean()
+    .sort_values("MAE")
+)
+display(overall_comparison.style.background_gradient(cmap="Blues", subset=["MAE", "RMSE", "MAPE", "sMAPE"]))
+
+# %% [markdown]
+# ## 4. Results and model interpretation
+# 
+# The aggregate table above averages each metric across the 16 products over the 13-week test horizon. The main results are:
+# 
+# | Model | MAE | RMSE | MAPE | sMAPE |
+# |---|---:|---:|---:|---:|
+# | AutoARIMA | 10.122 | 12.550 | 6.836% | 6.759% |
+# | Prophet | 10.131 | 12.524 | 6.871% | 6.766% |
+# | ARIMA | 10.171 | **12.510** | 6.869% | 6.792% |
+# | LightGBM | 10.641 | 13.274 | 7.268% | 7.101% |
+# | Last Value | 15.697 | 18.412 | 10.597% | 10.545% |
+# 
+# **Primary finding:** AutoARIMA is the strongest overall baseline by MAE, MAPE, and sMAPE. Its average absolute error is about 10.1 units per product-week, compared with 15.7 for Last Value. This is a reduction of approximately 35% in MAE relative to the naive benchmark. ARIMA has the lowest RMSE, indicating a small advantage when the evaluation emphasizes unusually large misses, although the difference from AutoARIMA is very small.
+# 
+# **Model comparison:** Prophet is effectively tied with AutoARIMA on MAE and sMAPE, while explicit ARIMA is close behind. This suggests that the product series contain enough temporal structure for univariate time-series models to outperform simply repeating the last observation. LightGBM does improve substantially over Last Value, but it underperforms the three univariate statistical baselines in this experiment. The likely explanation is not that tree models are unsuitable in general; rather, the recursive LightGBM setup has limited future information and must carry commercial context forward, which reduces the value of those covariates over a 13-week horizon.
+# 
+# **Product-level interpretation:** The heatmap should be read alongside the aggregate table. Aggregate averages can hide products that behave differently, so the lowest average model is not automatically the best model for every SKU. For the selected `Whey Protein` series, Prophet is best with MAE 8.184, followed by AutoARIMA at 9.586; Last Value is substantially worse at 23.846. This product-level result reinforces the general conclusion while also showing why the next analysis should examine model stability across products and forecast origins.
+# 
+# **Metric interpretation:** MAE is the clearest unit-based measure of typical error. RMSE is higher than MAE for every model because it gives extra weight to larger misses. MAPE and sMAPE are both around 7% for the best models, but percentage metrics should be interpreted with care for low-volume products because small actual values receive more influence. The scoring implementation protects against division by zero with a small numerical floor; that prevents a crash but does not remove the underlying interpretive limitation.
+
+# %%
+product_comparison = metrics_by_product.pivot(index="Product Name", columns="Model", values="MAE").sort_index()
+display(product_comparison.style.background_gradient(cmap="YlGn", axis=None))
+
+fig = px.bar(
+    overall_comparison.reset_index(),
+    x="Model",
+    y="MAE",
+    title=f"Average test MAE by baseline | cutoff: {TRAIN_END_DATE.date()}",
+    text_auto=".2f",
+    color="Model",
+    category_orders={"Model": list(model_functions)},
+)
+fig.update_layout(showlegend=False, yaxis_title="Mean absolute error (units sold)")
+fig.show()
+
+metric_heatmap = px.imshow(
+    product_comparison,
+    text_auto=".1f",
+    aspect="auto",
+    color_continuous_scale="YlGn",
+    title="Product-level MAE by baseline (lower is better)",
+    labels={"x": "Model", "y": "Product Name", "color": "MAE"},
+)
+metric_heatmap.show()
+
+# %% [markdown]
+# ## 5. Inspect one product
+# 
+# Change `PRODUCT_TO_PLOT` in the configuration cell and re-run this cell to inspect another product. The chart compares the full historical series with forecasts on the test horizon and marks the information cutoff.
+
+# %%
+if PRODUCT_TO_PLOT not in forecast_store:
+    raise ValueError(f"Unknown product {PRODUCT_TO_PLOT!r}; choose from {products}")
+
+series = product_series(PRODUCT_TO_PLOT)
+plot_frame = pd.DataFrame({"Actual": series})
+for model_name in model_functions:
+    plot_frame[model_name] = forecast_store[PRODUCT_TO_PLOT][model_name]
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=plot_frame.index, y=plot_frame["Actual"], name="Actual", mode="lines", line={"color": "#1f2937", "width": 2}))
+colors = {"Last Value": "#6b7280", "ARIMA": "#2563eb", "AutoARIMA": "#dc2626", "Prophet": "#059669", "LightGBM": "#d97706"}
+for model_name, color in colors.items():
+    fig.add_trace(go.Scatter(x=test_dates, y=plot_frame.loc[test_dates, model_name], name=model_name, mode="lines+markers", line={"color": color, "dash": "dash"}))
+fig.add_vline(x=TRAIN_END_DATE, line_dash="dot", line_color="#6b7280", annotation_text="train/test cutoff")
+fig.update_layout(title=f"{PRODUCT_TO_PLOT}: actuals and baseline forecasts", xaxis_title="Date", yaxis_title=target_col, hovermode="x unified")
+fig.show()
+
+display(metrics_by_product.loc[metrics_by_product["Product Name"] == PRODUCT_TO_PLOT].sort_values("MAE"))
+
+# %% [markdown]
+# ## 6. Analysed conclusion and next step
+# 
+# This baseline experiment establishes a useful and defensible reference point for the supplement-sales project. The naive Last Value forecast is clearly inadequate for this dataset: every fitted model improves on it across all four reported metrics. The strongest aggregate choice for typical percentage and unit error is **AutoARIMA**, with MAE 10.122, MAPE 6.836%, and sMAPE 6.759%. **ARIMA** has the best RMSE at 12.510, so it is marginally preferable if the cost of large individual misses is the primary concern. Prophet is statistically competitive with both and is the best model for the selected Whey Protein product.
+# 
+# The important conclusion is therefore not simply that one algorithm wins. The data shows that temporal structure is more useful than a naive carry-forward forecast, but this single holdout does not establish a universal winner. The difference among AutoARIMA, Prophet, and ARIMA is small relative to the variation that may occur across products, cutoff dates, and forecast horizons. LightGBM's weaker result is also informative: adding contextual columns does not automatically improve forecasting when future covariates are unavailable and must be carried forward.
+# 
+# For the next notebook, treat AutoARIMA, Prophet, and ARIMA as the conventional benchmark envelope and retain Last Value as the naive floor. Any agentic forecast should be compared against these recorded results on the same product, cutoff, horizon, and metrics. The next level of validation should use rolling-origin backtesting, report performance by forecast horizon and product, and include probabilistic metrics such as CRPS and interval coverage. Only after that broader evaluation should a model be selected for operational use.
+# 
+# Known limitations of this notebook:
+# 
+# - The evaluation uses one chronological 13-week holdout, so results may be sensitive to this particular period.
+# - The aggregate table is a simple mean across products; it is not volume-weighted and can give a small product the same influence as a large product.
+# - MAPE and sMAPE can be unstable or misleading for low-volume weeks; WMAPE or MASE should be considered for complementary reporting.
+# - Forecasts are point estimates only and provide no uncertainty intervals.
+# - LightGBM's carried-forward future context is an explicit assumption and should be replaced with known future covariates when available.
+# - The notebook clips negative forecasts to zero, which is appropriate for units sold but should be documented when comparing model behavior.
+# 
+# The notebook's outputs are therefore best understood as a baseline audit: they identify a strong conventional starting point, expose the value of temporal modeling, and define the benchmark that the next notebook must beat or meaningfully complement.
+
+# %% [markdown]
+# 
+
+

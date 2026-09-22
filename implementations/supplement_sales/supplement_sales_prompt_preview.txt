@@ -1,0 +1,36 @@
+{
+  "task": "supplement_sales_whey_protein_agent_forecast",
+  "product_name": "Whey Protein",
+  "category": "Protein",
+  "as_of": "2024-12-30",
+  "horizons_weeks": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "standard_quantiles": [
+    0.05,
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9,
+    0.95
+  ],
+  "target_summary": {
+    "last_units_sold": 131.0,
+    "last_date": "2024-12-30",
+    "mean_units_sold": 150.67307692307693,
+    "min_units_sold": 126.0,
+    "max_units_sold": 175.0
+  },
+  "recent_history_csv": "Date,Units Sold,Price,Revenue,Discount,Units Returned\n2024-01-08,149,52.3100,7794.1900,0.1100,2\n2024-01-15,148,53.4700,7913.5600,0.1200,4\n2024-01-22,158,30.6800,4847.4400,0.0900,2\n2024-01-29,149,23.0600,3435.9400,0.0800,3\n2024-02-05,144,38.9800,5613.1200,0.1800,0\n2024-02-12,144,34.1000,4910.4000,0.1800,4\n2024-02-19,139,35.1500,4885.8500,0.1200,2\n2024-02-26,148,59.4400,8797.1200,0.0200,0\n2024-03-04,163,32.0100,5217.6300,0.1500,0\n2024-03-11,160,37.5600,6009.6000,0.2400,5\n2024-03-18,168,30.3000,5090.4000,0.2000,2\n2024-03-25,148,13.2300,1958.0400,0.1200,1\n2024-04-01,148,27.2600,4034.4800,0.0900,3\n2024-04-08,128,39.7000,5081.6000,0.0700,2\n2024-04-15,153,52.1300,7975.8900,0.1500,1\n2024-04-22,162,36.6300,5934.0600,0.0600,1\n2024-04-29,155,41.6900,6461.9500,0.1800,0\n2024-05-06,163,19.8200,3230.6600,0.0800,2\n2024-05-13,149,44.3400,6606.6600,0.0100,1\n2024-05-20,136,13.1900,1793.8400,0.0700,1\n2024-05-27,130,58.6400,7623.2000,0.1300,1\n2024-06-03,138,56.8800,7849.4400,0.0500,1\n2024-06-10,143,33.7700,4829.1100,0.0200,2\n2024-06-17,138,38.8500,5361.3000,0.0200,2\n2024-06-24,130,49.6500,6454.5000,0.0800,1\n2024-07-01,144,12.6900,1827.3600,0.2500,3\n2024-07-08,158,39.5300,6245.7400,0.1300,2\n2024-07-15,149,39.8600,5939.1400,0.1700,1\n2024-07-22,154,38.0700,5862.7800,0.2100,2\n2024-07-29,151,29.2100,4410.7100,0.1500,2\n2024-08-05,168,58.1300,9765.8400,0.2000,3\n2024-08-12,126,16.3000,2053.8000,0.2100,2\n2024-08-19,163,51.2200,8348.8600,0.1800,3\n2024-08-26,165,13.0700,2156.5500,0.0600,3\n2024-09-02,153,50.6600,7750.9800,0.0800,4\n2024-09-09,175,42.8200,7493.5000,0.1000,1\n2024-09-16,143,32.7400,4681.8200,0.1400,0\n2024-09-23,158,27.3100,4314.9800,0.0200,1\n2024-09-30,153,17.5300,2682.0900,0.2400,2\n2024-10-07,140,27.6800,3875.2000,0.2300,2\n2024-10-14,146,16.3300,2384.1800,0.1700,0\n2024-10-21,156,29.9900,4678.4400,0.1900,1\n2024-10-28,150,27.0100,4051.5000,0.0400,4\n2024-11-04,156,35.2000,5491.2000,0.2400,2\n2024-11-11,163,41.5500,6772.6500,0.1000,1\n2024-11-18,153,52.7000,8063.1000,0.2400,1\n2024-11-25,159,13.3600,2124.2400,0.0500,4\n2024-12-02,168,36.5700,6143.7600,0.1700,1\n2024-12-09,150,44.7300,6709.5000,0.2500,1\n2024-12-16,143,21.8000,3117.4000,0.0700,5\n2024-12-23,169,52.0100,8789.6900,0.2100,1\n2024-12-30,131,14.3300,1877.2300,0.0700,0",
+  "context_note": "Only observations on or before as_of are available. Future price, discount, revenue, returns, promotions, and other transaction context are unknown; do not treat their historical values as known future inputs. State important assumptions explicitly.",
+  "instructions": "Produce exactly one forecast for every horizon in horizons_weeks. Use only information available on or before as_of. Use exactly the levels in standard_quantiles, make quantiles non-decreasing, make point_forecast equal the 0.50 quantile, keep demand forecasts non-negative, and widen uncertainty appropriately with horizon. Put assumptions and the main evidence in the rationale fields. Return the result by calling set_model_response with a json_response string matching output_schema exactly.",
+  "output_schema": "{\n  \"forecasts\": [\n    {\n      \"horizon\": \"<integer \\u2014 one entry per horizon from the task>\",\n      \"point_forecast\": \"<float \\u2014 must equal the 0.50 quantile value>\",\n      \"quantiles\": [\n        {\n          \"quantile\": 0.05,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.1,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.2,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.3,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.4,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.5,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.6,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.7,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.8,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.9,\n          \"value\": \"<float>\"\n        },\n        {\n          \"quantile\": 0.95,\n          \"value\": \"<float>\"\n        }\n      ],\n      \"rationale\": \"<string>\"\n    }\n  ],\n  \"rationale\": \"<string, optional overall explanation>\"\n}"
+}
